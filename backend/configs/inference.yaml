@@ -1,0 +1,31 @@
+model: models/best.pt
+labels: data/labels.json
+image_size: 224
+top_k: 5
+require_crop_confirmation: true
+unconstrained_rejection_threshold: 0.9453882575035095
+crop_constrained_rejection_threshold: 0.9922456741333008
+low_confidence_action: needs_review
+minimum_crop_probability_mass: 0.007913063280284405
+quality:
+  enabled: true
+  min_short_side: 96
+  min_brightness: 25
+  max_brightness: 235
+  max_dark_fraction: 0.80
+  max_bright_fraction: 0.80
+  min_sharpness: 136.16793823242188
+gradcam_target_layer: model.model[-1].conv
+deepseek:
+  enabled: true
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  api_key_env: DEEPSEEK_API_KEY
+  timeout_seconds: 45
+  max_tokens: 2500
+  temperature: 0.2
+rag:
+  enabled: true
+  corpus: knowledge/disease_guidance.jsonl
+  chunk_size_chars: 480
+  top_k: 1

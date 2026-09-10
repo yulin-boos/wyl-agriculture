@@ -13,10 +13,10 @@ Vue 3 网页前端与 FastAPI 后端。后端在病害诊断前检查图片是�
 
 ## Linux 服务器首次部署
 
-仓库为私有，先为服务器配置 GitHub 只读 deploy key，再执行：
+仓库为公开，服务器拉取代码无需 GitHub Token，执行：
 
 ```bash
-git clone git@github.com:yulin-boos/wyl-agriculture.git
+git clone https://github.com/yulin-boos/wyl-agriculture.git
 cd wyl-agriculture/backend
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt

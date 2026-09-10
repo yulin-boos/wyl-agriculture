@@ -11,15 +11,18 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import and_, delete, func, select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from crop_disease.advice import DeepSeekAdviceError
 from crop_disease.advice import provider_catalog
 from crop_disease.image_gate import ImageGateError
 from fastapi.responses import JSONResponse
-from app.database import check_database, create_tables, get_session
-from app.models import DiagnosisRecord
+from app.database import check_database, check_schema, get_session
+from app.models import Crop, Disease, DiagnosisFeedback, DiagnosisRecord, User
+from app.auth import optional_user, router as auth_router
+from pydantic import BaseModel, ConfigDict, Field
 from app.schemas import (
     ApiProviderOption,
     ApiProviderTestResponse,
@@ -28,6 +31,7 @@ from app.schemas import (
     HistoryResponse,
 )
 from app.services import service
+from app.admin import router as admin_router
 
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -46,7 +50,7 @@ def allowed_origins() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    create_tables()
+    check_schema()
     yield
 
 
@@ -55,11 +59,13 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(admin_router)
+app.include_router(auth_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins(),
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -69,6 +75,20 @@ async def image_gate_error_handler(_, error: ImageGateError) -> JSONResponse:
     # Keep detail as a string for existing ArkTS/web error handling.
     return JSONResponse(status_code=error.status_code,
                         content={"detail": error.message, "code": error.code})
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_error_handler(_, error: SQLAlchemyError) -> JSONResponse:
+    LOGGER.error("Database operation failed: %s", type(error).__name__)
+    return JSONResponse(status_code=503, content={"detail": "数据库操作失败，请检查数据库配置后重试。"})
+
+
+def owner_filter(user: User | None, client_id: str | None):
+    if user is not None:
+        return DiagnosisRecord.user_id == user.id
+    if not client_id:
+        raise HTTPException(status_code=422, detail="请登录或提供 client_id。")
+    return and_(DiagnosisRecord.user_id.is_(None), DiagnosisRecord.client_id == validate_uuid(client_id))
 
 
 def validate_uuid(value: str, field_name: str = "client_id") -> str:
@@ -162,7 +182,7 @@ def crops() -> list[dict[str, str]]:
 @app.post("/api/diagnoses", response_model=DiagnosisRecordResponse, status_code=201)
 async def create_diagnosis(
     image: UploadFile = File(...),
-    client_id: str = Form(...),
+    client_id: str | None = Form(None),
     crop: str = Form(...),
     symptom_description: str | None = Form(None),
     api_provider: str | None = Form(None),
@@ -170,8 +190,10 @@ async def create_diagnosis(
     api_model: str | None = Form(None),
     api_key: str | None = Form(None),
     session: Session = Depends(get_session),
+    user: User | None = Depends(optional_user),
 ) -> DiagnosisRecordResponse:
-    normalized_client_id = validate_uuid(client_id)
+    owner_filter(user, client_id)
+    normalized_client_id = validate_uuid(client_id) if client_id else None
     suffix = Path(image.filename or "image.jpg").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="仅支持 JPG、PNG、WEBP 或 BMP 图片。")
@@ -219,7 +241,16 @@ async def create_diagnosis(
             temporary_path.unlink(missing_ok=True)
 
     prediction = diagnosis["predictions"][0]
+    disease = session.scalar(select(Disease).where(Disease.model_label == str(prediction["label"])))
+    if disease is None:
+        raise HTTPException(status_code=422, detail="数据库中缺少识别标签，请先初始化分类数据。")
+    catalog_crop = session.get(Crop, disease.crop_id)
+    if catalog_crop is None or catalog_crop.crop_key != crop:
+        raise HTTPException(status_code=422, detail="识别结果与所选作物不匹配。")
     record = DiagnosisRecord(
+        user_id=user.id if user else None,
+        crop_id=disease.crop_id,
+        disease_id=disease.id,
         client_id=normalized_client_id,
         crop=str(prediction.get("crop") or crop),
         crop_zh=str(prediction.get("crop_zh") or crop),
@@ -241,20 +272,21 @@ async def create_diagnosis(
 
 @app.get("/api/diagnoses", response_model=HistoryResponse)
 def diagnosis_history(
-    client_id: str = Query(...),
+    client_id: str | None = Query(None),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     session: Session = Depends(get_session),
+    user: User | None = Depends(optional_user),
 ) -> HistoryResponse:
-    normalized_client_id = validate_uuid(client_id)
+    ownership = owner_filter(user, client_id)
     total = session.scalar(
         select(func.count(DiagnosisRecord.id)).where(
-            DiagnosisRecord.client_id == normalized_client_id
+            ownership
         )
     ) or 0
     records = session.scalars(
         select(DiagnosisRecord)
-        .where(DiagnosisRecord.client_id == normalized_client_id)
+        .where(ownership)
         .order_by(DiagnosisRecord.created_at.desc())
         .offset(offset)
         .limit(limit)
@@ -265,17 +297,87 @@ def diagnosis_history(
 @app.get("/api/diagnoses/{record_id}", response_model=DiagnosisRecordResponse)
 def diagnosis_detail(
     record_id: str,
-    client_id: str = Query(...),
+    client_id: str | None = Query(None),
     session: Session = Depends(get_session),
+    user: User | None = Depends(optional_user),
 ) -> DiagnosisRecordResponse:
-    normalized_client_id = validate_uuid(client_id)
+    ownership = owner_filter(user, client_id)
     normalized_record_id = validate_uuid(record_id, "record_id")
     record = session.scalar(
         select(DiagnosisRecord).where(
             DiagnosisRecord.id == normalized_record_id,
-            DiagnosisRecord.client_id == normalized_client_id,
+            ownership,
         )
     )
     if record is None:
         raise HTTPException(status_code=404, detail="找不到该诊断记录。")
     return to_response(record)
+
+
+class FeedbackInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    is_correct: bool = Field(strict=True)
+    corrected_disease_id: int | None = Field(default=None, gt=0)
+    content: str | None = Field(default=None, max_length=2000)
+
+
+def owned_record(record_id: str, client_id: str | None, user: User | None, session: Session):
+    record = session.scalar(select(DiagnosisRecord).where(
+        DiagnosisRecord.id == validate_uuid(record_id, "record_id"), owner_filter(user, client_id)
+    ))
+    if record is None:
+        raise HTTPException(status_code=404, detail="找不到该诊断记录。")
+    return record
+
+
+@app.get("/api/diseases")
+def disease_catalog(crop: str | None = None, session: Session = Depends(get_session)):
+    statement = select(Disease, Crop).join(Crop).where(Crop.status == "active")
+    if crop:
+        statement = statement.where(Crop.crop_key == crop)
+    return [{"id": disease.id, "label": disease.model_label, "name": disease.name_zh,
+             "crop": plant.crop_key, "category": disease.category}
+            for disease, plant in session.execute(statement.order_by(Disease.model_class_index))]
+
+
+@app.post("/api/diagnoses/{record_id}/feedback", status_code=201)
+def add_feedback(record_id: str, data: FeedbackInput, client_id: str | None = Query(None),
+                 session: Session = Depends(get_session), user: User | None = Depends(optional_user)):
+    history = owned_record(record_id, client_id, user, session)
+    if data.corrected_disease_id is not None:
+        corrected = session.get(Disease, data.corrected_disease_id)
+        if data.is_correct or corrected is None or corrected.crop_id != history.crop_id or corrected.id == history.disease_id:
+            raise HTTPException(status_code=422, detail="修正病害必须属于同一作物且不同于原诊断，并将 is_correct 设为 false。")
+    feedback = DiagnosisFeedback(
+        history_id=history.id, user_id=history.user_id, client_id=history.client_id,
+        is_correct=data.is_correct, corrected_disease_id=data.corrected_disease_id, content=data.content,
+    )
+    try:
+        session.add(feedback)
+        session.commit()
+        session.refresh(feedback)
+    except IntegrityError as error:
+        session.rollback()
+        if session.scalar(select(DiagnosisFeedback.id).where(DiagnosisFeedback.history_id == history.id)):
+            raise HTTPException(status_code=409, detail="该诊断已提交反馈。") from error
+        raise
+    return {"id": feedback.id, "history_id": feedback.history_id, **data.model_dump()}
+
+
+@app.get("/api/diagnoses/{record_id}/feedback")
+def get_feedback(record_id: str, client_id: str | None = Query(None),
+                 session: Session = Depends(get_session), user: User | None = Depends(optional_user)):
+    history = owned_record(record_id, client_id, user, session)
+    feedback = session.scalar(select(DiagnosisFeedback).where(DiagnosisFeedback.history_id == history.id))
+    if feedback is None:
+        raise HTTPException(status_code=404, detail="暂无反馈。")
+    return {"id": feedback.id, "history_id": history.id, "is_correct": feedback.is_correct,
+            "corrected_disease_id": feedback.corrected_disease_id, "content": feedback.content}
+
+
+@app.delete("/api/diagnoses/{record_id}", status_code=204)
+def delete_diagnosis(record_id: str, client_id: str | None = Query(None),
+                     session: Session = Depends(get_session), user: User | None = Depends(optional_user)):
+    history = owned_record(record_id, client_id, user, session)
+    session.execute(delete(DiagnosisRecord).where(DiagnosisRecord.id == history.id))
+    session.commit()

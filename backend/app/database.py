@@ -1,23 +1,17 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Generator
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SQLITE_PATH = PROJECT_ROOT / ".local" / "web.db"
 
 
 def database_url() -> str:
     configured = os.getenv("DATABASE_URL", "").strip()
     if configured:
         return configured
-    DEFAULT_SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return f"sqlite:///{DEFAULT_SQLITE_PATH.as_posix()}"
+    raise RuntimeError("请设置 DATABASE_URL 指向 hezhen_db；测试可显式使用 SQLite。")
 
 
 def engine_connect_args(url: str) -> dict[str, object]:
@@ -43,6 +37,11 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
 
+if engine.dialect.name == "sqlite":
+    @event.listens_for(engine, "connect")
+    def enable_sqlite_foreign_keys(connection, _):
+        connection.execute("PRAGMA foreign_keys=ON")
+
 
 class Base(DeclarativeBase):
     pass
@@ -57,6 +56,18 @@ def create_tables() -> None:
 def check_database() -> None:
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
+
+
+def check_schema() -> None:
+    from sqlalchemy import inspect
+    from app.models import Base
+    inspector = inspect(engine)
+    for table in Base.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            raise RuntimeError("数据库尚未初始化，请先导入禾诊_MySQL初始化.sql。")
+        actual = {column["name"] for column in inspector.get_columns(table.name)}
+        if set(table.columns.keys()) - actual:
+            raise RuntimeError(f"数据库表 {table.name} 字段不完整，请按配套架构迁移。")
 
 
 def get_session() -> Generator[Session, None, None]:

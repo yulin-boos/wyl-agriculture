@@ -12,10 +12,12 @@ from fastapi.testclient import TestClient
 from crop_disease.image_gate import AgriculturalImageGate, GateSettings, ImageGateError, evaluate_scores
 from app.services import DiagnosisWebService
 from app.main import app, get_session, service
+from database_case import DatabaseTestCase
 
 
-class ImageGateTests(unittest.TestCase):
+class ImageGateTests(DatabaseTestCase):
     def setUp(self):
+        super().setUp()
         self.settings = GateSettings(Path("missing-model"))
 
     def test_crop_passes(self):
@@ -74,6 +76,7 @@ class ImageGateTests(unittest.TestCase):
 
     def test_accepted_gate_preserves_diagnosis_flow(self):
         instance = DiagnosisWebService()
+        instance.supports_crop("Tomato")
         instance.image_gate = Mock()
         instance.image_gate.check.return_value = {"accepted": True}
         instance._engine = Mock()

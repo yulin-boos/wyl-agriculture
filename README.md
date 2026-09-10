@@ -22,6 +22,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 cp .env.example .env
 # 编辑 .env，填写已有云数据库连接、API 密钥等。
+# 先在 MySQL 导入 sql/禾诊_MySQL初始化.sql，再启动后端。
 .venv/bin/python scripts/prepare_image_gate.py
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --env-file .env
 ```
@@ -31,6 +32,8 @@ cp .env.example .env
 已有服务部署在其他目录时，先在新目录完成依赖、模型和配置验证，再调整服务工作目录，不要直接覆盖正在运行的目录或复制数据库到 Git。
 
 ## 后续更新
+
+本次数据库已改为 `hezhen_db` 六表架构。升级前先备份并导入配套 SQL，更新 `DATABASE_URL`；如有旧 `diagnosis_records` 或 SQLite 历史，按 [后端迁移说明](backend/README.md) 复制到新表。服务不会在启动时自动迁移已有数据库。
 
 在仓库根目录运行：
 
